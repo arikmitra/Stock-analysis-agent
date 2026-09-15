@@ -24,6 +24,9 @@ Graph flow:
     generate_recommendation  (ALWAYS deterministic -- see recommendation.py)
       │
       ▼
+    generate_ai_recommendation  (SKIPPED unless state["recommendation_mode"] == "ai")
+      │
+      ▼
     generate_llm_commentary  (SKIPPED unless state["llm_provider"] is set)
       │
       ▼
@@ -32,17 +35,35 @@ Graph flow:
       ▼
      END
 
-The LLM commentary node is opt-in and best-effort: if `llm_provider` is
-unset, it's skipped entirely via a conditional edge (see graph.py) and
-never even runs. If it IS set but the call fails (missing API key,
-network error, etc), the node catches the error, records it in
-`llm_error`, and the graph proceeds to `build_report` exactly as if the
-LLM had never been requested -- a failed or misconfigured LLM provider
-never blocks or changes the deterministic recommendation.
+Two independent, both-optional LLM-touching nodes exist and serve
+different purposes:
+
+  - `generate_ai_recommendation` (this file) / `ai_recommendation.py`:
+    can produce its OWN BUY/HOLD/SELL call, as an opt-in alternative
+    DECISION-MAKING path to the deterministic scorer. Only reached when
+    `recommendation_mode == "ai"`. If it fails or returns something
+    unparseable, the node falls back to the deterministic call rather
+    than propagating the failure -- `recommendation` is guaranteed to
+    always be a valid BUY/HOLD/SELL either way.
+
+  - `generate_llm_commentary` / `llm_advisor.py`: can only EXPLAIN a
+    call that's already been finalized (whichever one ended up in
+    `recommendation` -- deterministic or AI). It never changes the
+    outcome. Only reached when `llm_provider` is set.
+
+`generate_recommendation` (the deterministic scorer) always runs, on
+every single request, regardless of either of the above -- this is what
+"deterministic path is the default" means concretely: the rule-based
+call is computed unconditionally, and it is also what `recommendation`
+resolves to unless AI mode was both requested AND successful.
 """
 
 from __future__ import annotations
 
+from .ai_recommendation import (
+    AIRecommendationError,
+    generate_ai_recommendation as _generate_ai_recommendation,
+)
 from .data_source import DataFetchError, fetch_history
 from .feedback import FeedbackError, record_feedback
 from .indicators import add_all_indicators
@@ -66,6 +87,8 @@ DEFAULT_LOOKBACK_DAYS = 60
 # this, we fail fast with a clear message instead of a confusing empty result.
 MIN_LOOKBACK_DAYS = 30
 
+VALID_RECOMMENDATION_MODES = ("deterministic", "ai")
+
 
 def validate_ticker(state: AgentState) -> dict:
     """Validate and normalize the input ticker symbol.
@@ -74,9 +97,9 @@ def validate_ticker(state: AgentState) -> dict:
     this is a fast, local sanity check so obviously-bad input fails quickly
     with a clear message before we spend a network round trip on it.
 
-    Also validates `lookback_days` if the caller provided one, since a bad
-    value here (too small, non-numeric) is just as much a "fix your input"
-    error as a bad ticker, and should fail before any network call too.
+    Also validates `lookback_days` and `recommendation_mode` if the caller
+    provided them, since a bad value here is just as much a "fix your
+    input" error as a bad ticker, and should fail before any network call too.
     """
     ticker = state.get("ticker", "")
 
@@ -121,6 +144,18 @@ def validate_ticker(state: AgentState) -> dict:
                 ),
                 "error_stage": "validate_ticker",
             }
+
+    recommendation_mode = state.get("recommendation_mode")
+    if recommendation_mode is not None and recommendation_mode not in VALID_RECOMMENDATION_MODES:
+        return {
+            "is_valid": False,
+            "normalized_ticker": normalized,
+            "error": (
+                f"recommendation_mode must be one of {VALID_RECOMMENDATION_MODES}, "
+                f"got {recommendation_mode!r}."
+            ),
+            "error_stage": "validate_ticker",
+        }
 
     return {"normalized_ticker": normalized, "is_valid": True}
 
@@ -192,10 +227,16 @@ def calculate_indicators(state: AgentState) -> dict:
 def generate_recommendation(state: AgentState) -> dict:
     """Run the rule-based BUY/HOLD/SELL scoring logic on the latest indicators.
 
-    This is ALWAYS the deterministic path -- see recommendation.py. It
-    never consults an LLM, regardless of state["llm_provider"]. The
-    optional LLM commentary node runs strictly after this one and can only
-    explain this result, never change it.
+    This ALWAYS runs and ALWAYS produces `deterministic_recommendation` --
+    it never consults an LLM, regardless of state["recommendation_mode"]
+    or state["llm_provider"]. It also seeds `recommendation` /
+    `recommendation_reasons` / `recommendation_source` with the
+    deterministic result as the default "active" call; the optional
+    `generate_ai_recommendation` node (running strictly after this one)
+    may override those three fields if AI mode was requested and
+    succeeded, but `deterministic_recommendation` itself is never
+    touched by that -- the rule-based baseline is always present in the
+    final state for comparison, regardless of which mode is active.
     """
     indicators = state.get("indicators")
 
@@ -205,25 +246,107 @@ def generate_recommendation(state: AgentState) -> dict:
         return {"error": str(exc), "error_stage": "generate_recommendation"}
 
     return {
+        "deterministic_recommendation": result.recommendation,
+        "deterministic_reasons": result.reasons,
+        "signal_details": result.signal_details,
+        # Seed the "active" call with the deterministic result. This is
+        # the ONLY value `recommendation` will ever hold unless
+        # generate_ai_recommendation_node below both runs and succeeds.
         "recommendation": result.recommendation,
         "recommendation_reasons": result.reasons,
-        "signal_details": result.signal_details,
+        "recommendation_source": "deterministic",
     }
+
+
+def generate_ai_recommendation_node(state: AgentState) -> dict:
+    """Optionally let an LLM produce its OWN BUY/HOLD/SELL call, as an
+    alternative to the deterministic scorer's result.
+
+    Only reached if `state["recommendation_mode"] == "ai"` (see graph.py's
+    conditional edge) -- if unset or "deterministic" (the default), this
+    node is skipped entirely and `recommendation` stays exactly what
+    `generate_recommendation` set it to, so there is zero behavior change
+    for callers who don't opt into this feature.
+
+    On success: overwrites `recommendation` / `recommendation_reasons` /
+    `recommendation_source` with the AI's call, and records it separately
+    in `ai_recommendation` / `ai_recommendation_reasoning` /
+    `ai_recommendation_used=True`. `deterministic_recommendation` is left
+    untouched throughout, so the rule-based baseline remains visible for
+    comparison in the final report.
+
+    On failure (missing API key, network error, unparseable response,
+    unsupported provider name, etc): does NOT raise and does NOT route to
+    handle_error. Instead it records the failure in
+    `ai_recommendation_error` / `ai_recommendation_used=False` and leaves
+    `recommendation` exactly as the deterministic node set it -- this is
+    the fallback-to-deterministic guarantee described in the module
+    docstring. A broken or misconfigured AI provider can never leave the
+    user without a valid, safe recommendation.
+    """
+    mode = state.get("recommendation_mode")
+    if mode != "ai":
+        # Defensive fallback; graph.py's routing should prevent reaching
+        # here at all when mode isn't "ai", but keep this safe regardless
+        # in case this node is ever wired up differently.
+        return {}
+
+    provider_name = state.get("llm_provider")
+    if not provider_name:
+        return {
+            "ai_recommendation_used": False,
+            "ai_recommendation_error": (
+                "recommendation_mode='ai' was set but no llm_provider was "
+                "specified; falling back to the deterministic recommendation."
+            ),
+        }
+
+    try:
+        provider = get_provider(provider_name, model=state.get("llm_model"))
+        result = _generate_ai_recommendation(
+            provider=provider,
+            ticker=state["normalized_ticker"],
+            company_name=state.get("company_name"),
+            signal_details=state["signal_details"],
+            deterministic_recommendation=state.get("deterministic_recommendation"),
+            deterministic_reasons=state.get("deterministic_reasons"),
+        )
+        return {
+            "ai_recommendation": result.recommendation,
+            "ai_recommendation_reasoning": result.reasoning,
+            "ai_recommendation_used": True,
+            # Override the "active" call -- deterministic_recommendation
+            # remains untouched in state, so it's still visible/comparable.
+            "recommendation": result.recommendation,
+            "recommendation_reasons": [result.reasoning],
+            "recommendation_source": "ai",
+        }
+    except (LLMAdvisorError, AIRecommendationError, ValueError) as exc:
+        # ValueError covers get_provider() rejecting an unsupported name.
+        # Deliberately no "recommendation"/"recommendation_reasons"/
+        # "recommendation_source" keys in this return -- leaving them
+        # unset means the deterministic values set by generate_recommendation
+        # remain in effect, which is exactly the fallback behavior we want.
+        return {
+            "ai_recommendation_used": False,
+            "ai_recommendation_error": str(exc),
+        }
 
 
 def generate_llm_commentary_node(state: AgentState) -> dict:
     """Optionally generate narrative commentary via an LLM, explaining the
-    already-final deterministic recommendation.
+    already-final ACTIVE recommendation (deterministic or AI, whichever
+    `recommendation` currently holds).
 
     Only reached if `state["llm_provider"]` is set (see graph.py's
     conditional edge) -- if unset, this node is skipped entirely and the
     graph proceeds straight to build_report, so there is zero behavior
     change for callers who don't opt in.
 
-    Failures here (missing API key, network error, bad model name, etc)
-    are caught and recorded in `llm_error` rather than raised -- a broken
-    or misconfigured LLM provider must never block the deterministic
-    report from being produced.
+    Failures here (missing API key, network error, etc) are caught and
+    recorded in `llm_error` rather than raised -- a broken or
+    misconfigured LLM provider must never block the report from being
+    produced, regardless of which recommendation path is active.
     """
     provider_name = state.get("llm_provider")
     if not provider_name:
@@ -262,6 +385,10 @@ def build_report(state: AgentState) -> dict:
         llm_commentary=state.get("llm_commentary"),
         llm_error=state.get("llm_error"),
         history_rows=state.get("history_rows") or 10,
+        recommendation_source=state.get("recommendation_source", "deterministic"),
+        deterministic_recommendation=state.get("deterministic_recommendation"),
+        deterministic_reasons=state.get("deterministic_reasons"),
+        ai_recommendation_error=state.get("ai_recommendation_error"),
     )
     return {"report": report_text}
 
