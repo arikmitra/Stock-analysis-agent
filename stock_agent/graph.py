@@ -10,7 +10,8 @@ Architecture
       │
       ▼
 ┌─────────────────┐
-│ validate_ticker  │  Local, fast sanity check on ticker + lookback_days.
+│ validate_ticker  │  Local, fast sanity check on ticker + lookback_days
+│                  │  + recommendation_mode.
 └────────┬─────────┘
          │
    ┌─────┴─────┐
@@ -40,9 +41,28 @@ Architecture
          │     └──────────────────┤
          ▼                        │
 ┌──────────────────────┐          │
-│generate_recommendation│  ALWAYS deterministic (recommendation.py)
-└────────┬───────────────┘          │
+│generate_recommendation│  ALWAYS deterministic (recommendation.py);
+└────────┬───────────────┘  seeds `recommendation` with the rule-based call
          │                          │
+   ┌─────┴────────────────┐          │
+   │ recommendation_mode  │          │
+   │      == "ai"?         │          │
+   └─────┬────────────────┘          │
+   yes   │   no                     │
+         │    └──────────┐          │
+         ▼                │          │
+┌──────────────────────┐  │          │
+│generate_ai_          │  │          │
+│  recommendation       │  │          │
+│  (may OVERRIDE        │  │          │
+│  `recommendation`;    │  │          │
+│  falls back to the    │  │          │
+│  deterministic call   │  │          │
+│  on any failure --    │  │          │
+│  never blocks report) │  │          │
+└────────┬───────────────┘  │          │
+         │                  │          │
+         ▼                  ▼          │
    ┌─────┴──────────┐               │
    │ llm_provider set?│               │
    └─────┬──────────┘               │
@@ -52,7 +72,9 @@ Architecture
 ┌──────────────────────┐  │          │
 │generate_llm_commentary│  │          │
 │  (best-effort; never  │  │          │
-│  blocks the report)   │  │          │
+│  blocks the report;   │  │          │
+│  explains whichever   │  │          │
+│  call is active)      │  │          │
 └────────┬───────────────┘  │          │
          │                  │          │
          ▼                  ▼          │
@@ -68,13 +90,30 @@ its own conditional edge that routes straight to `handle_error` on failure,
 so a bad ticker or a network hiccup never crashes the graph -- it always
 terminates with a `report` string in the final state.
 
-The LLM commentary node is opt-in via `state["llm_provider"]`. When unset
-(the default), the conditional edge after `generate_recommendation` skips
-straight to `build_report` -- the LLM node never even runs, so there is
-zero behavior or performance difference for callers who don't use this
-feature. When the LLM node does run and fails, it degrades gracefully
-(see nodes.py) rather than routing to handle_error, since a broken LLM
-provider should never prevent the deterministic report from being shown.
+Two independent opt-in nodes follow `generate_recommendation`, each
+skipped entirely by default:
+
+  - `generate_ai_recommendation` is reached only when
+    `state["recommendation_mode"] == "ai"`. It can OVERRIDE
+    `state["recommendation"]` with an AI-generated call -- this is the
+    one node in the whole graph allowed to change the "active"
+    recommendation after the deterministic scorer set it. If it fails
+    for any reason (missing key, network error, unparseable response),
+    it does NOT route to handle_error -- it leaves `recommendation`
+    exactly as the deterministic node set it, which is the
+    fallback-to-deterministic guarantee. `deterministic_recommendation`
+    itself is never touched, so the rule-based baseline remains visible
+    in the final report regardless of which mode is active.
+
+  - `generate_llm_commentary` is reached only when `state["llm_provider"]`
+    is set. It can only EXPLAIN whichever call is currently active
+    (deterministic or AI) -- it never changes `recommendation`. Failures
+    here degrade the same way (recorded in `llm_error`, never routes to
+    handle_error).
+
+Both nodes read from the same `llm_provider`/`llm_model` fields and reuse
+the same `LLMProvider` transport (see llm_advisor.py), but serve
+different purposes: one can decide, the other can only explain.
 """
 
 from __future__ import annotations
@@ -101,11 +140,12 @@ def _route_after_indicators(state: AgentState) -> str:
     return "handle_error" if state.get("error") else "generate_recommendation"
 
 
-def _route_after_recommendation(state: AgentState) -> str:
-    """Conditional edge: only visit the LLM commentary node if the caller
-    opted in via state["llm_provider"]. This is the switch that keeps the
-    deterministic path as the default -- an unset llm_provider means the
-    LLM node is skipped entirely, not just a no-op call.
+def _route_after_recommendation_common(state: AgentState) -> str:
+    """Conditional edge shared by both the deterministic-only and
+    AI-recommendation paths: only visit the LLM commentary node if the
+    caller opted in via state["llm_provider"]. This runs after whichever
+    recommendation path was active, so commentary always explains the
+    final `recommendation` value -- deterministic or AI.
     """
     return "generate_llm_commentary" if state.get("llm_provider") else "build_report"
 
@@ -123,6 +163,7 @@ def build_graph():
     workflow.add_node("fetch_data", nodes.fetch_data)
     workflow.add_node("calculate_indicators", nodes.calculate_indicators)
     workflow.add_node("generate_recommendation", nodes.generate_recommendation)
+    workflow.add_node("generate_ai_recommendation", nodes.generate_ai_recommendation_node)
     workflow.add_node("generate_llm_commentary", nodes.generate_llm_commentary_node)
     workflow.add_node("build_report", nodes.build_report)
     workflow.add_node("handle_error", nodes.handle_error)
@@ -148,10 +189,31 @@ def build_graph():
     )
 
     # After the deterministic recommendation, optionally detour through
-    # LLM commentary before reaching build_report.
+    # AI recommendation generation (which may override `recommendation`),
+    # then optionally through LLM commentary (which never overrides
+    # anything), before reaching build_report.
+    #
+    # This single conditional edge on generate_recommendation covers all
+    # three possible next steps (AI node / commentary node / straight to
+    # build_report) in one routing function, rather than chaining through
+    # an intermediate pass-through node -- LangGraph conditional edges can
+    # map to any number of named destinations, so there's no need for one.
     workflow.add_conditional_edges(
         "generate_recommendation",
-        _route_after_recommendation,
+        lambda state: (
+            "generate_ai_recommendation"
+            if state.get("recommendation_mode") == "ai"
+            else _route_after_recommendation_common(state)
+        ),
+        {
+            "generate_ai_recommendation": "generate_ai_recommendation",
+            "generate_llm_commentary": "generate_llm_commentary",
+            "build_report": "build_report",
+        },
+    )
+    workflow.add_conditional_edges(
+        "generate_ai_recommendation",
+        _route_after_recommendation_common,
         {"generate_llm_commentary": "generate_llm_commentary", "build_report": "build_report"},
     )
     workflow.add_edge("generate_llm_commentary", "build_report")
@@ -222,6 +284,7 @@ def analyze_stock(
     history_rows: int | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
+    recommendation_mode: str | None = None,
 ) -> AgentState:
     """Convenience wrapper: build the graph, run it once, and return final state.
 
@@ -235,18 +298,36 @@ def analyze_stock(
             agent's original behavior). Independent of `lookback_days` --
             e.g. fetch 90 days for stable indicators but only display the
             most recent 15 rows.
-        llm_provider: Optional -- "openai" or "gemini" to enable narrative
-            AI commentary alongside the (always deterministic)
-            recommendation. Defaults to None, meaning no LLM is used at
-            all and behavior is identical to the pre-LLM version of this
-            agent.
+        llm_provider: Optional -- "openai" or "gemini". Used by both
+            optional LLM-touching features below: narrative commentary
+            (always) and AI-driven recommendations (only if
+            recommendation_mode="ai"). Defaults to None, meaning no LLM
+            is used at all and behavior is identical to the pre-LLM
+            version of this agent.
         llm_model: Optional model name override for the chosen provider
             (e.g. "gpt-4o", "gemini-1.5-pro"). Ignored if llm_provider is None.
+        recommendation_mode: "deterministic" (default, whether passed
+            explicitly or left as None) or "ai". Controls which call
+            becomes the ACTIVE `result["recommendation"]`:
+              - "deterministic" (default): the rule-based scorer's call,
+                exactly as before this feature existed.
+              - "ai": requires `llm_provider` to also be set. An LLM
+                independently evaluates the same indicator values and its
+                call becomes `result["recommendation"]` -- but only if
+                the call succeeds and parses cleanly; any failure falls
+                back to the deterministic call automatically (see
+                `result["ai_recommendation_error"]` /
+                `result["ai_recommendation_used"]`). The deterministic
+                result remains available in
+                `result["deterministic_recommendation"]` regardless of
+                which mode was requested or which one ultimately won.
 
     Returns:
         The final AgentState dict after the graph has run to completion.
         Always contains a "report" key -- either a success report or an
         error report -- so callers can always safely print(result["report"]).
+        Always contains "deterministic_recommendation" on a successful
+        run, regardless of `recommendation_mode`.
     """
     graph = build_graph()
     inputs: dict = {"ticker": ticker}
@@ -258,6 +339,8 @@ def analyze_stock(
         inputs["llm_provider"] = llm_provider
     if llm_model is not None:
         inputs["llm_model"] = llm_model
+    if recommendation_mode is not None:
+        inputs["recommendation_mode"] = recommendation_mode
 
     result = graph.invoke(inputs)
     return result
